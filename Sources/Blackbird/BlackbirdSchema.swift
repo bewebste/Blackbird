@@ -53,9 +53,9 @@ extension Blackbird {
         case data
         
         internal static func parseType(_ str: String) -> ColumnType? {
-            if str.hasPrefix("TEXT") { return .text }
+			if str.hasPrefix("TEXT") || str.hasPrefix("VARCHAR") { return .text }
             if str.hasPrefix("INT") || str.hasPrefix("BOOL") { return .integer }
-            if str.hasPrefix("FLOAT") || str.hasPrefix("DOUBLE") || str.hasPrefix("REAL") || str.hasPrefix("NUMERIC") { return .double }
+			if str.hasPrefix("FLOAT") || str.hasPrefix("DOUBLE") || str.hasPrefix("REAL") || str.hasPrefix("NUMERIC") || str.hasPrefix("TIMESTAMP") { return .double }
             if str.hasPrefix("BLOB") { return .data }
             return nil
         }
