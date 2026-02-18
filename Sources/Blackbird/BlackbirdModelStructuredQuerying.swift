@@ -31,7 +31,7 @@
 //  SOFTWARE.
 //
 
-extension PartialKeyPath: @unchecked Sendable { }
+extension PartialKeyPath: @unchecked @retroactive Sendable { }
 
 public extension String.StringInterpolation {
     mutating func appendInterpolation<T: BlackbirdModel>(_ keyPath: T.BlackbirdColumnKeyPath) {
@@ -47,28 +47,38 @@ public extension String.StringInterpolation {
 /// - `.descending(keyPath)`: equivalent to `ORDER BY keyPath DESC` in SQL
 ///
 /// Used as a `orderBy:` expression in ``BlackbirdModel`` functions such as:
-/// - ``BlackbirdModel/query(in:columns:matching:orderBy:limit:)``
-/// - ``BlackbirdModel/read(from:matching:orderBy:limit:)``
+/// - ``BlackbirdModel/query(in:columns:matching:orderBy:limit:)-(Blackbird.Database,_,_,_,_)``
+/// - ``BlackbirdModel/read(from:matching:orderBy:limit:)-(Blackbird.Database,_,_,_)``
 public struct BlackbirdModelOrderClause<T: BlackbirdModel>: Sendable, CustomDebugStringConvertible {
     public enum Direction: Sendable {
-        case ascending
-        case descending
+        case ascending(column: T.BlackbirdColumnKeyPath)
+        case descending(column: T.BlackbirdColumnKeyPath)
+        case random
     }
     
-    let column: T.BlackbirdColumnKeyPath
     let direction: Direction
     
-    public static func ascending(_ column: T.BlackbirdColumnKeyPath) -> BlackbirdModelOrderClause { BlackbirdModelOrderClause(column, direction: .ascending) }
-    public static func descending(_ column: T.BlackbirdColumnKeyPath) -> BlackbirdModelOrderClause { BlackbirdModelOrderClause(column, direction: .descending) }
+    public static func ascending(_ column: T.BlackbirdColumnKeyPath)  -> BlackbirdModelOrderClause { BlackbirdModelOrderClause(direction: .ascending(column: column)) }
+    public static func descending(_ column: T.BlackbirdColumnKeyPath) -> BlackbirdModelOrderClause { BlackbirdModelOrderClause(direction: .descending(column: column)) }
+    public static var random: BlackbirdModelOrderClause { BlackbirdModelOrderClause(direction: .random) }
     
-    init(_ column: T.BlackbirdColumnKeyPath, direction: Direction) {
-        self.column = column
+    init(direction: Direction) {
         self.direction = direction
     }
     
     func orderByClause(table: Blackbird.Table) -> String {
-        let columnName = table.keyPathToColumnName(keyPath: column)
-        return "`\(columnName)`\(direction == .descending ? " DESC" : "")"
+        switch direction {
+            case .ascending(let column):
+                let columnName = table.keyPathToColumnName(keyPath: column)
+                return "`\(columnName)`"
+
+            case .descending(let column):
+                let columnName = table.keyPathToColumnName(keyPath: column)
+                return "`\(columnName)` DESC"
+
+            case .random:
+                return "RANDOM()"
+        }
     }
 
     public var debugDescription: String { orderByClause(table: T.table) }
@@ -105,10 +115,21 @@ fileprivate struct DecodedStructuredQuery: Sendable {
         for (keyPath, value) in updating {
             let columnName = table.keyPathToColumnName(keyPath: keyPath)
             changedColumns.insert(columnName)
-            setClauses.append("`\(columnName)` = ?")
-            arguments.append(try! Blackbird.Value.fromAny(value))
             
-            if updateWhereAutoOptimization {
+            let constantValue: Blackbird.Value?
+            if let valueExpression = value as? BlackbirdColumnExpression<T> {
+                constantValue = valueExpression.constantValue
+                let (placeholder, values) = valueExpression.expressionInUpdateQuery(table: table)
+                setClauses.append("`\(columnName)` = \(placeholder)")
+                arguments.append(contentsOf: values)
+            } else {
+                let valueWrapped = try! Blackbird.Value.fromAny(value)
+                setClauses.append("`\(columnName)` = ?")
+                arguments.append(valueWrapped)
+                constantValue = valueWrapped
+            }
+                        
+            if updateWhereAutoOptimization, let constantValue {
                 // In an UPDATE query, SQLite will call the update hook and report a change on EVERY row
                 // that matches the WHERE clause (or every row in the table without a WHERE) and report it
                 // as changed, even if no rows matched and therefore no data was changed. E.g.:
@@ -123,19 +144,21 @@ fileprivate struct DecodedStructuredQuery: Sendable {
                 // ...which makes SQLite properly report only the actually-changed rows.
                 //
                 if updateWhereNotMatchingExpr != nil {
-                    updateWhereNotMatchingExpr = updateWhereNotMatchingExpr! || keyPath != value
+                    updateWhereNotMatchingExpr = updateWhereNotMatchingExpr! || keyPath != constantValue
                 } else {
-                    updateWhereNotMatchingExpr = keyPath != value
+                    updateWhereNotMatchingExpr = keyPath != constantValue
                 }
             }
         }
         if !setClauses.isEmpty {
             clauses.append("SET \(setClauses.joined(separator: ","))")
 
-            if matching != nil, let updateWhereNotMatchingExpr {
-                matching = matching! && updateWhereNotMatchingExpr
-            } else {
-                matching = updateWhereNotMatchingExpr
+            if let updateWhereNotMatchingExpr {
+                if matching != nil {
+                    matching = matching! && updateWhereNotMatchingExpr
+                } else {
+                    matching = updateWhereNotMatchingExpr
+                }
             }
         }
 
@@ -199,13 +222,14 @@ extension BlackbirdModel {
         return result
     }
 
-    fileprivate static func _cacheableStructuredResultIsolated<T: Sendable>(database: Blackbird.Database, core: isolated Blackbird.Database.Core, decoded: DecodedStructuredQuery, resultFetcher: ((Blackbird.Database, isolated Blackbird.Database.Core) throws -> T)) throws -> T {
+    fileprivate static func _cacheableStructuredResult<T: Sendable>(core: isolated Blackbird.Database.Core, decoded: DecodedStructuredQuery, resultFetcher: ((isolated Blackbird.Database.Core) throws -> T)) throws -> T {
         let cacheLimit = Self.cacheLimit
-        guard cacheLimit > 0, let cacheKey = decoded.cacheKey else { return try resultFetcher(database, core) }
+        guard cacheLimit > 0, let cacheKey = decoded.cacheKey else { return try resultFetcher(core) }
         
+        let database = try core.database()
         if let cachedResult = database.cache.readQueryResult(tableName: decoded.tableName, cacheKey: cacheKey) as? T { return cachedResult }
         
-        let result = try resultFetcher(database, core)
+        let result = try resultFetcher(core)
         database.cache.writeQueryResult(tableName: decoded.tableName, cacheKey: cacheKey, result: result, entryLimit: cacheLimit)
         return result
     }
@@ -233,10 +257,10 @@ extension BlackbirdModel {
     }
 
     /// Synchronous version of ``count(in:matching:)``  for use when the database actor is isolated within calls to ``Blackbird/Database/transaction(_:)`` or ``Blackbird/Database/cancellableTransaction(_:)``.
-    public static func countIsolated(in database: Blackbird.Database, core: isolated Blackbird.Database.Core, matching: BlackbirdModelColumnExpression<Self>? = nil) throws -> Int {
+    public static func count(in core: isolated Blackbird.Database.Core, matching: BlackbirdModelColumnExpression<Self>? = nil) throws -> Int {
         let decoded = DecodedStructuredQuery(operation: "SELECT COUNT(*) FROM", matching: matching)
-        return try _cacheableStructuredResultIsolated(database: database, core: core, decoded: decoded) {
-            try _queryInternalIsolated(in: $0, core: $1, decoded.query, arguments: decoded.arguments).first!["COUNT(*)"]!.intValue!
+        return try _cacheableStructuredResult(core: core, decoded: decoded) {
+            try _queryInternal(in: $0, decoded.query, arguments: decoded.arguments).first!["COUNT(*)"]!.intValue!
         }
     }
 
@@ -276,10 +300,11 @@ extension BlackbirdModel {
     }
 
     /// Synchronous version of ``read(from:matching:orderBy:limit:)``  for use when the database actor is isolated within calls to ``Blackbird/Database/transaction(_:)`` or ``Blackbird/Database/cancellableTransaction(_:)``.
-    public static func readIsolated(from database: Blackbird.Database, core: isolated Blackbird.Database.Core, matching: BlackbirdModelColumnExpression<Self>? = nil, orderBy: BlackbirdModelOrderClause<Self> ..., limit: Int? = nil) throws -> [Self] {
+    public static func read(from core: isolated Blackbird.Database.Core, matching: BlackbirdModelColumnExpression<Self>? = nil, orderBy: BlackbirdModelOrderClause<Self> ..., limit: Int? = nil) throws -> [Self] {
         let decoded = DecodedStructuredQuery(matching: matching, orderBy: orderBy, limit: limit)
-        return try _cacheableStructuredResultIsolated(database: database, core: core, decoded: decoded) { database, core in
-            try _queryInternalIsolated(in: database, core: core, decoded.query, arguments: decoded.arguments).map {
+        let database = try core.database()
+        return try _cacheableStructuredResult(core: core, decoded: decoded) { core in
+            try _queryInternal(in: core, decoded.query, arguments: decoded.arguments).map {
                 let decoder = BlackbirdSQLiteDecoder(database: database, row: $0.row)
                 return try Self(from: decoder)
             }
@@ -306,10 +331,10 @@ extension BlackbirdModel {
     }
 
     /// Synchronous version of ``query(in:columns:matching:orderBy:limit:)`` for use when the database actor is isolated within calls to ``Blackbird/Database/transaction(_:)`` or ``Blackbird/Database/cancellableTransaction(_:)``.
-    public static func queryIsolated(in database: Blackbird.Database, core: isolated Blackbird.Database.Core, columns: [BlackbirdColumnKeyPath], matching: BlackbirdModelColumnExpression<Self>? = nil, orderBy: BlackbirdModelOrderClause<Self> ..., limit: Int? = nil) throws -> [Blackbird.ModelRow<Self>] {
+    public static func query(in core: isolated Blackbird.Database.Core, columns: [BlackbirdColumnKeyPath], matching: BlackbirdModelColumnExpression<Self>? = nil, orderBy: BlackbirdModelOrderClause<Self> ..., limit: Int? = nil) throws -> [Blackbird.ModelRow<Self>] {
         let decoded = DecodedStructuredQuery(selectColumnSubset: columns, matching: matching, orderBy: orderBy, limit: limit)
-        return try _cacheableStructuredResultIsolated(database: database, core: core, decoded: decoded) {
-            try _queryInternalIsolated(in: $0, core: $1, decoded.query, arguments: decoded.arguments)
+        return try _cacheableStructuredResult(core: core, decoded: decoded) {
+            try _queryInternal(in: $0, decoded.query, arguments: decoded.arguments)
         }
     }
 
@@ -327,8 +352,8 @@ extension BlackbirdModel {
     }
 
     /// Synchronous version of ``query(in:columns:primaryKey:)`` for use when the database actor is isolated within calls to ``Blackbird/Database/transaction(_:)`` or ``Blackbird/Database/cancellableTransaction(_:)``.
-    public static func queryIsolated(in database: Blackbird.Database, core: isolated Blackbird.Database.Core, columns: [BlackbirdColumnKeyPath], primaryKey: Any) throws -> Blackbird.ModelRow<Self>? {
-        try queryIsolated(in: database, core: core, columns: columns, multicolumnPrimaryKey: [primaryKey])
+    public static func query(in core: isolated Blackbird.Database.Core, columns: [BlackbirdColumnKeyPath], primaryKey: Any) throws -> Blackbird.ModelRow<Self>? {
+        try query(in: core, columns: columns, multicolumnPrimaryKey: [primaryKey])
     }
 
     /// Selects a subset of the table's columns matching the given column values, using column key-paths for this model type.
@@ -346,10 +371,10 @@ extension BlackbirdModel {
     }
 
     /// Synchronous version of ``query(in:columns:multicolumnPrimaryKey:)`` for use when the database actor is isolated within calls to ``Blackbird/Database/transaction(_:)`` or ``Blackbird/Database/cancellableTransaction(_:)``.
-    public static func queryIsolated(in database: Blackbird.Database, core: isolated Blackbird.Database.Core, columns: [BlackbirdColumnKeyPath], multicolumnPrimaryKey: [Any]) throws -> Blackbird.ModelRow<Self>? {
+    public static func query(in core: isolated Blackbird.Database.Core, columns: [BlackbirdColumnKeyPath], multicolumnPrimaryKey: [Any]) throws -> Blackbird.ModelRow<Self>? {
         let decoded = DecodedStructuredQuery(selectColumnSubset: columns, forMulticolumnPrimaryKey: multicolumnPrimaryKey)
-        return try _cacheableStructuredResultIsolated(database: database, core: core, decoded: decoded) {
-            try _queryInternalIsolated(in: $0, core: $1, decoded.query, arguments: decoded.arguments).first
+        return try _cacheableStructuredResult(core: core, decoded: decoded) {
+            try _queryInternal(in: $0, decoded.query, arguments: decoded.arguments).first
         }
     }
 
@@ -374,18 +399,28 @@ extension BlackbirdModel {
     /// // "UPDATE Post SET title = 'Hi' WHERE id < 100 OR title IS NULL"
     /// ```
     ///
-    /// If matching against specific primary-key values, use ``update(in:set:forPrimaryKeys:)`` instead.
+    /// If matching against specific primary-key values, use ``update(in:set:forPrimaryKeys:)-(Blackbird.Database,[BlackbirdColumnKeyPath:BlackbirdColumnExpression<Self>],_)`` instead.
     public static func update(in database: Blackbird.Database, set changes: [BlackbirdColumnKeyPath: Sendable?], matching: BlackbirdModelColumnExpression<Self>) async throws {
         if changes.isEmpty { return }
-        try await updateIsolated(in: database, core: database.core, set: changes, matching: matching)
+        try await update(in: database.core, set: changes, matching: matching)
     }
 
+    public static func update(in database: Blackbird.Database, set changes: [BlackbirdColumnKeyPath: BlackbirdColumnExpression<Self>], matching: BlackbirdModelColumnExpression<Self>) async throws {
+        if changes.isEmpty { return }
+        try await update(in: database.core, set: changes, matching: matching)
+    }
+
+    public static func update(in core: isolated Blackbird.Database.Core, set changes: [BlackbirdColumnKeyPath: BlackbirdColumnExpression<Self>], matching: BlackbirdModelColumnExpression<Self>) throws {
+        try update(in: core, set: changes as [BlackbirdColumnKeyPath: Sendable?], matching: matching)
+    }
+    
     /// Synchronous version of ``update(in:set:matching:)`` for use when the database actor is isolated within calls to ``Blackbird/Database/transaction(_:)`` or ``Blackbird/Database/cancellableTransaction(_:)``.
-    public static func updateIsolated(in database: Blackbird.Database, core: isolated Blackbird.Database.Core, set changes: [BlackbirdColumnKeyPath: Sendable?], matching: BlackbirdModelColumnExpression<Self>) throws {
+    public static func update(in core: isolated Blackbird.Database.Core, set changes: [BlackbirdColumnKeyPath: Sendable?], matching: BlackbirdModelColumnExpression<Self>) throws {
+        let database = try core.database()
         if database.options.contains(.readOnly) { fatalError("Cannot update BlackbirdModels in a read-only database") }
         if changes.isEmpty { return }
         let table = Self.table
-        try table.resolveWithDatabaseIsolated(type: Self.self, database: database, core: core) { try Self.validateSchema(database: $0, core: $1) }
+        try table.resolveWithDatabase(type: Self.self, core: core) { try Self.validateSchema(core: $0) }
         let decoded = DecodedStructuredQuery(operation: "UPDATE", matching: matching, updating: changes)
 
         let changeCountBefore = core.changeCount
@@ -393,7 +428,7 @@ extension BlackbirdModel {
         defer {
             let changedRowIDs = database.changeReporter.stopIgnoringWrites()
             let changeCount = core.changeCount - changeCountBefore
-            var primaryKeys = try? primaryKeysFromRowIDs(in: database, core: core, rowIDs: changedRowIDs)
+            var primaryKeys = try? primaryKeysFromRowIDs(in: core, rowIDs: changedRowIDs)
             if primaryKeys != nil, primaryKeys!.count != changeCount { primaryKeys = nil }
             
             if changeCount > 0 {
@@ -403,8 +438,9 @@ extension BlackbirdModel {
         try core.query(decoded.query, arguments: decoded.arguments)
     }
     
-    private static func primaryKeysFromRowIDs(in database: Blackbird.Database, core: isolated Blackbird.Database.Core, rowIDs: Set<Int64>) throws -> [[Blackbird.Value]]? {
+    private static func primaryKeysFromRowIDs(in core: isolated Blackbird.Database.Core, rowIDs: Set<Int64>) throws -> [[Blackbird.Value]]? {
         if rowIDs.isEmpty { return [] }
+        let database = try core.database()
         if rowIDs.count > database.maxQueryVariableCount { return nil }
     
         let table = Self.table
@@ -424,7 +460,7 @@ extension BlackbirdModel {
     ///   - changes: A dictionary of column key-paths of this BlackbirdModel type and corresponding values to set them to, e.g. `[ \.$title : "New title" ]`.
     ///   - forPrimaryKeys: A collection of primary-key values on which to apply the changes if present in the database.
     ///
-    /// This is preferred over ``update(in:set:matching:)`` when the only matching criteria is primary-key value, since the change reporter can subsequently send the specific primary-key values that have potentially changed.
+    /// This is preferred over ``update(in:set:matching:)-(Blackbird.Database,[BlackbirdColumnKeyPath:BlackbirdColumnExpression<Self>],_)`` when the only matching criteria is primary-key value, since the change reporter can subsequently send the specific primary-key values that have potentially changed.
     ///
     /// ## Example
     /// ```swift
@@ -436,10 +472,15 @@ extension BlackbirdModel {
     /// // Equivalent to:
     /// // "UPDATE Post SET title = 'Hi' WHERE (id = 1 OR id = 2 OR id = 3)"
     /// ```
-    /// For tables with multi-column primary keys, use ``update(in:set:forMulticolumnPrimaryKeys:)``.
+    /// For tables with multi-column primary keys, use ``update(in:set:forMulticolumnPrimaryKeys:)-(Blackbird.Database,[BlackbirdColumnKeyPath:BlackbirdColumnExpression<Self>],_)``.
     public static func update(in database: Blackbird.Database, set changes: [BlackbirdColumnKeyPath: Sendable?], forPrimaryKeys: [Sendable]) async throws {
         if changes.isEmpty { return }
-        try await updateIsolated(in: database, core: database.core, set: changes, forMulticolumnPrimaryKeys: forPrimaryKeys.map { [$0] })
+        try await update(in: database.core, set: changes, forMulticolumnPrimaryKeys: forPrimaryKeys.map { [$0] })
+    }
+
+    public static func update(in database: Blackbird.Database, set changes: [BlackbirdColumnKeyPath: BlackbirdColumnExpression<Self>], forPrimaryKeys: [Sendable]) async throws {
+        if changes.isEmpty { return }
+        try await update(in: database.core, set: changes, forMulticolumnPrimaryKeys: forPrimaryKeys.map { [$0] })
     }
 
     /// Changes a subset of the table's rows by multi-column primary-key values, using column key-paths for this model type.
@@ -448,7 +489,7 @@ extension BlackbirdModel {
     ///   - changes: A dictionary of column key-paths of this BlackbirdModel type and corresponding values to set them to, e.g. `[ \.$title : "New title" ]`.
     ///   - forMulticolumnPrimaryKeys: A collection of multicolumn-primary-key value arrays on which to apply the changes if present in the database.
     ///
-    /// This is preferred over ``update(in:set:matching:)`` when the only matching criteria is primary-key value, since the change reporter can subsequently send the specific primary-key values that have potentially changed.
+    /// This is preferred over ``update(in:set:matching:)-(Blackbird.Database,[BlackbirdColumnKeyPath:BlackbirdColumnExpression<Self>],_)`` when the only matching criteria is primary-key value, since the change reporter can subsequently send the specific primary-key values that have potentially changed.
     ///
     /// ## Example
     /// ```swift
@@ -462,24 +503,38 @@ extension BlackbirdModel {
     /// // "UPDATE Post SET title = 'Hi' WHERE (id = 1 AND title = 'Title1') OR (id = 2 AND title = 'Title2')"
     /// ```
     ///
-    /// For tables with single-column primary keys, ``update(in:set:forPrimaryKeys:)`` may also be used.
+    /// For tables with single-column primary keys, ``update(in:set:forPrimaryKeys:)-(Blackbird.Database,[BlackbirdColumnKeyPath:BlackbirdColumnExpression<Self>],_)`` may also be used.
     public static func update(in database: Blackbird.Database, set changes: [BlackbirdColumnKeyPath: Sendable?], forMulticolumnPrimaryKeys: [[Sendable]]) async throws {
         if changes.isEmpty { return }
-        try await updateIsolated(in: database, core: database.core, set: changes, forMulticolumnPrimaryKeys: forMulticolumnPrimaryKeys)
+        try await update(in: database.core, set: changes, forMulticolumnPrimaryKeys: forMulticolumnPrimaryKeys)
+    }
+
+    public static func update(in database: Blackbird.Database, set changes: [BlackbirdColumnKeyPath: BlackbirdColumnExpression<Self>], forMulticolumnPrimaryKeys: [[Sendable]]) async throws {
+        if changes.isEmpty { return }
+        try await update(in: database.core, set: changes, forMulticolumnPrimaryKeys: forMulticolumnPrimaryKeys)
     }
 
     /// Synchronous version of ``update(in:set:forPrimaryKeys:)`` for use when the database actor is isolated within calls to ``Blackbird/Database/transaction(_:)`` or ``Blackbird/Database/cancellableTransaction(_:)``.
-    public static func updateIsolated(in database: Blackbird.Database, core: isolated Blackbird.Database.Core, set changes: [BlackbirdColumnKeyPath: Sendable?], forPrimaryKeys: [Sendable]) throws {
-        try updateIsolated(in: database, core: core, set: changes, forMulticolumnPrimaryKeys: forPrimaryKeys.map { [$0] })
+    public static func update(in core: isolated Blackbird.Database.Core, set changes: [BlackbirdColumnKeyPath: Sendable?], forPrimaryKeys: [Sendable]) throws {
+        try update(in: core, set: changes, forMulticolumnPrimaryKeys: forPrimaryKeys.map { [$0] })
     }
 
+    public static func update(in core: isolated Blackbird.Database.Core, set changes: [BlackbirdColumnKeyPath: BlackbirdColumnExpression<Self>], forPrimaryKeys: [Sendable]) throws {
+        try update(in: core, set: changes, forMulticolumnPrimaryKeys: forPrimaryKeys.map { [$0] })
+    }
+
+    public static func update(in core: isolated Blackbird.Database.Core, set changes: [BlackbirdColumnKeyPath: BlackbirdColumnExpression<Self>], forMulticolumnPrimaryKeys primaryKeyValues: [[Sendable]]) throws {
+        try update(in: core, set: changes as [BlackbirdColumnKeyPath: Sendable?], forMulticolumnPrimaryKeys: primaryKeyValues)
+    }
+    
     /// Synchronous version of ``update(in:set:forMulticolumnPrimaryKeys:)`` for use when the database actor is isolated within calls to ``Blackbird/Database/transaction(_:)`` or ``Blackbird/Database/cancellableTransaction(_:)``.
-    public static func updateIsolated(in database: Blackbird.Database, core: isolated Blackbird.Database.Core, set changes: [BlackbirdColumnKeyPath: Sendable?], forMulticolumnPrimaryKeys primaryKeyValues: [[Sendable]]) throws {
+    public static func update(in core: isolated Blackbird.Database.Core, set changes: [BlackbirdColumnKeyPath: Sendable?], forMulticolumnPrimaryKeys primaryKeyValues: [[Sendable]]) throws {
+        let database = try core.database()
         if database.options.contains(.readOnly) { fatalError("Cannot update BlackbirdModels in a read-only database") }
         if changes.isEmpty { return }
         let primaryKeyValues = Array(primaryKeyValues)
         let table = Self.table
-        _ = try table.resolveWithDatabaseIsolated(type: Self.self, database: database, core: core) { try Self.validateSchema(database: $0, core: $1) }
+        _ = try table.resolveWithDatabase(type: Self.self, core: core) { try Self.validateSchema(core: $0) }
 
         let decoded = DecodedStructuredQuery(operation: "UPDATE", updating: changes, updateWhereAutoOptimization: false)
 
@@ -523,7 +578,6 @@ extension BlackbirdModel {
     ///   - matching: A filtering expression using column key-paths, e.g. `\.$id == 1`, to be used in the resulting SQL query as a `WHERE` clause. See ``BlackbirdModelColumnExpression``.
     ///
     ///       Use `.all` to delete all rows in the table (executes an SQL `DELETE` without a `WHERE` clause).
-    /// - Returns: An array of matching rows, each containing only the columns specified.
     ///
     /// ## Example
     /// ```swift
@@ -532,14 +586,15 @@ extension BlackbirdModel {
     /// // "DELETE FROM Post WHERE id = 123"
     /// ```
     public static func delete(from database: Blackbird.Database, matching: BlackbirdModelColumnExpression<Self>) async throws {
-        try await deleteIsolated(from: database, core: database.core, matching: matching)
+        try await delete(from: database.core, matching: matching)
     }
 
     /// Synchronous version of ``delete(from:matching:)`` for use when the database actor is isolated within calls to ``Blackbird/Database/transaction(_:)`` or ``Blackbird/Database/cancellableTransaction(_:)``.
-    public static func deleteIsolated(from database: Blackbird.Database, core: isolated Blackbird.Database.Core, matching: BlackbirdModelColumnExpression<Self>) throws {
+    public static func delete(from core: isolated Blackbird.Database.Core, matching: BlackbirdModelColumnExpression<Self>) throws {
+        let database = try core.database()
         if database.options.contains(.readOnly) { fatalError("Cannot delete BlackbirdModels from a read-only database") }
         let table = Self.table
-        try table.resolveWithDatabaseIsolated(type: Self.self, database: database, core: core) { try Self.validateSchema(database: $0, core: $1) }
+        try table.resolveWithDatabase(type: Self.self, core: core) { try Self.validateSchema(core: $0) }
 
         let decoded = DecodedStructuredQuery(operation: "DELETE FROM", matching: matching)
 
@@ -620,10 +675,10 @@ public func || <T: BlackbirdModel> (lhs: BlackbirdModelColumnExpression<T>, rhs:
 /// - `.like(\.$title, "the%")`: equivalent to `WHERE title LIKE 'the%'`
 ///
 /// Used as a `matching:` expression in ``BlackbirdModel`` functions such as:
-/// - ``BlackbirdModel/query(in:columns:matching:orderBy:limit:)``
-/// - ``BlackbirdModel/read(from:matching:orderBy:limit:)``
-/// - ``BlackbirdModel/update(in:set:matching:)``
-/// - ``BlackbirdModel/delete(from:matching:)``
+/// - ``BlackbirdModel/query(in:columns:matching:orderBy:limit:)-(Blackbird.Database,_,_,_,_)``
+/// - ``BlackbirdModel/read(from:matching:orderBy:limit:)-(Blackbird.Database,_,_,_)``
+/// - ``BlackbirdModel/update(in:set:matching:)-(Blackbird.Database,[BlackbirdColumnKeyPath:BlackbirdColumnExpression<Self>],_)``
+/// - ``BlackbirdModel/delete(from:matching:)-(Blackbird.Database,_)``
 public struct BlackbirdModelColumnExpression<Model: BlackbirdModel>: Sendable, BlackbirdQueryExpression, CustomDebugStringConvertible {
 
     /// Use `.all` to operate on all rows in the table without a `WHERE` clause.
@@ -634,8 +689,8 @@ public struct BlackbirdModelColumnExpression<Model: BlackbirdModel>: Sendable, B
     }
 
     internal enum BinaryOperator: String, Sendable {
-        case equal = "="
-        case notEqual = "!="
+        case equal = "IS NOT DISTINCT FROM"
+        case notEqual = "IS DISTINCT FROM"
         case lessThan = "<"
         case greaterThan = ">"
         case lessThanOrEqual = "<="
@@ -776,7 +831,7 @@ public struct BlackbirdModelColumnExpression<Model: BlackbirdModel>: Sendable, B
     ///   - searchQuery: The text to search for.
     ///   - syntaxMode: How and whether the query is escaped or processed.
     ///
-    /// This operator only works for models declaring ``BlackbirdModel/fullTextSearchableColumns`` and when using ``BlackbirdModel/fullTextSearch(from:matching:limit:options:)``.
+    /// This operator only works for models declaring ``BlackbirdModel/fullTextSearchableColumns`` and when using ``BlackbirdModel/fullTextSearch(from:matching:limit:options:)-(Blackbird.Database,_,_,_)``.
     public static func match<T: BlackbirdModel>(column: T.BlackbirdColumnKeyPath? = nil, _ searchQuery: String, syntaxMode: BlackbirdFullTextQuerySyntaxMode = .escapeQuerySyntax) -> BlackbirdModelColumnExpression<T> {
         if let column {
             guard let config = T.fullTextSearchableColumns[column], config.indexed else {
@@ -914,3 +969,46 @@ internal struct BlackbirdColumnFTSMatchExpression<T: BlackbirdModel>: BlackbirdQ
         return (whereClause: "`\(columnOrFTSTableName)` MATCH ?", values: [.text(escapedQuery)])
     }
 }
+
+// MARK: - Update expressions
+
+public prefix func ! <T: BlackbirdModel> (lhs: T.BlackbirdColumnKeyPath) -> BlackbirdColumnExpression<T> { .not(keyPath: lhs) }
+public func * <T: BlackbirdModel> (lhs: T.BlackbirdColumnKeyPath, rhs: Sendable) -> BlackbirdColumnExpression<T> { .multiply(keyPath: lhs, value: rhs) }
+public func / <T: BlackbirdModel> (lhs: T.BlackbirdColumnKeyPath, rhs: Sendable) -> BlackbirdColumnExpression<T> { .divide(keyPath: lhs, value: rhs) }
+public func + <T: BlackbirdModel> (lhs: T.BlackbirdColumnKeyPath, rhs: Sendable) -> BlackbirdColumnExpression<T> { .add(keyPath: lhs, value: rhs) }
+public func - <T: BlackbirdModel> (lhs: T.BlackbirdColumnKeyPath, rhs: Sendable) -> BlackbirdColumnExpression<T> { .subtract(keyPath: lhs, value: rhs) }
+
+public enum BlackbirdColumnExpression<T: BlackbirdModel>: ExpressibleByFloatLiteral, ExpressibleByStringLiteral, ExpressibleByBooleanLiteral, ExpressibleByIntegerLiteral, ExpressibleByNilLiteral, Sendable {
+
+    public init(nilLiteral: ()) { self = .value(nil) }
+    public init(stringLiteral value: StaticString) { self = .value(value) }
+    public init(floatLiteral value: Double) { self = .value(value) }
+    public init(integerLiteral value: Int64) { self = .value(value) }
+    public init(booleanLiteral value: Bool) { self = .value(value) }
+    
+    case value(_ value: Sendable?)
+    case not(keyPath: T.BlackbirdColumnKeyPath)
+    case multiply(keyPath: T.BlackbirdColumnKeyPath, value: Sendable)
+    case divide(keyPath: T.BlackbirdColumnKeyPath, value: Sendable)
+    case add(keyPath: T.BlackbirdColumnKeyPath, value: Sendable)
+    case subtract(keyPath: T.BlackbirdColumnKeyPath, value: Sendable)
+    
+    internal var constantValue: Blackbird.Value? {
+        switch self {
+            case .value(let v): try! Blackbird.Value.fromAny(v)
+            default: nil
+        }
+    }
+
+    internal func expressionInUpdateQuery(table: Blackbird.Table) -> (queryExpression: String, arguments: [Blackbird.Value]) {
+        switch self {
+            case .value(let value): ("?", [try! Blackbird.Value.fromAny(value)])
+            case .not(let keyPath): ("NOT(`\(table.keyPathToColumnName(keyPath: keyPath))`)", [])
+            case .multiply(let keyPath, let value): ("`\(table.keyPathToColumnName(keyPath: keyPath))` * ?", [try! Blackbird.Value.fromAny(value)])
+            case .divide(let keyPath, let value): ("`\(table.keyPathToColumnName(keyPath: keyPath))` / ?", [try! Blackbird.Value.fromAny(value)])
+            case .add(let keyPath, let value): ("`\(table.keyPathToColumnName(keyPath: keyPath))` + ?", [try! Blackbird.Value.fromAny(value)])
+            case .subtract(let keyPath, let value):("`\(table.keyPathToColumnName(keyPath: keyPath))` - ?", [try! Blackbird.Value.fromAny(value)])
+        }
+    }
+}
+

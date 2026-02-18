@@ -124,15 +124,27 @@ public struct BlackbirdModelSearchOptions<T: BlackbirdModel>: Sendable {
     /// Can be used simultaneously with ``scoreMultipleColumn``. Scores will be multiplied by both values.
     let scoreMultiple: Double
     
+    let orderBy: [BlackbirdModelOrderClause<T>]
+    
     /// The default options: generate highlights and snippets, preload instances, and use only relevance-based ranking.
     public static var `default`: Self { .init() }
 
-    public init(highlights: HighlightMode = .generate(prefix: "<b>", suffix: "</b>"), snippets: SnippetMode = .generate(contextWords: 7, prefix: "<b>", suffix: "</b>", ellipsis: "…"), preloadInstances: Bool = true, scoreMultiple: Double = 1.0, scoreMultipleColumn: T.BlackbirdColumnKeyPath? = nil) {
+    public init(highlights: HighlightMode = .generate(prefix: "<b>", suffix: "</b>"), snippets: SnippetMode = .generate(contextWords: 7, prefix: "<b>", suffix: "</b>", ellipsis: "…"), preloadInstances: Bool = true, scoreMultiple: Double = 1.0, scoreMultipleColumn: T.BlackbirdColumnKeyPath? = nil, orderBy: BlackbirdModelOrderClause<T> ...) {
         self.highlights = highlights
         self.snippets = snippets
         self.preloadInstances = preloadInstances
         self.scoreMultiple = scoreMultiple
         self.scoreMultipleColumn = scoreMultipleColumn
+        self.orderBy = orderBy
+    }
+
+    public init(highlights: HighlightMode = .generate(prefix: "<b>", suffix: "</b>"), snippets: SnippetMode = .generate(contextWords: 7, prefix: "<b>", suffix: "</b>", ellipsis: "…"), preloadInstances: Bool = true, scoreMultiple: Double = 1.0, scoreMultipleColumn: T.BlackbirdColumnKeyPath? = nil, orderBy: [BlackbirdModelOrderClause<T>]) {
+        self.highlights = highlights
+        self.snippets = snippets
+        self.preloadInstances = preloadInstances
+        self.scoreMultiple = scoreMultiple
+        self.scoreMultipleColumn = scoreMultipleColumn
+        self.orderBy = orderBy
     }
 }
 
@@ -198,13 +210,13 @@ public struct BlackbirdModelSearchResult<T: BlackbirdModel>: Identifiable, Senda
     /// - Returns: The specified instance, or `nil` if it no longer exists in the database.
     public func instance(from database: Blackbird.Database) async throws -> T? {
         if let preloadedInstance { return preloadedInstance }
-        return try await instanceIsolated(from: database, core: database.core)
+        return try await instance(from: database.core)
     }
     
     /// Synchronous version of ``instance(from:)`` for use in database transactions.
-    public func instanceIsolated(from database: Blackbird.Database, core: isolated Blackbird.Database.Core) throws -> T? {
+    public func instance(from core: isolated Blackbird.Database.Core) throws -> T? {
         if let preloadedInstance { return preloadedInstance }
-        return try T.readIsolated(from: database, core: core, sqlWhere: "rowid = ?", arguments: [rowid]).first
+        return try T.read(from: core, sqlWhere: "rowid = ?", arguments: [rowid]).first
     }
     
     /// A subset of columns from this search result's model row.
@@ -213,12 +225,12 @@ public struct BlackbirdModelSearchResult<T: BlackbirdModel>: Identifiable, Senda
     ///   - columns: The column key-paths to select.
     /// - Returns: A ``Blackbird/ModelRow`` of the model's type with only the specified columns present.
     public func row(from database: Blackbird.Database, columns: [T.BlackbirdColumnKeyPath]) async throws -> Blackbird.ModelRow<T>? {
-        return try await rowIsolated(from: database, core: database.core, columns: columns)
+        return try await row(from: database.core, columns: columns)
     }
 
     /// Synchronous version of ``row(from:columns:)`` for use in database transactions.
-    public func rowIsolated(from database: Blackbird.Database, core: isolated Blackbird.Database.Core, columns: [T.BlackbirdColumnKeyPath]) throws -> Blackbird.ModelRow<T>? {
-        return try T.queryIsolated(in: database, core: core, columns: columns, matching: .literal("rowid = ?", rowid)).first
+    public func row(from core: isolated Blackbird.Database.Core, columns: [T.BlackbirdColumnKeyPath]) throws -> Blackbird.ModelRow<T>? {
+        return try T.query(in: core, columns: columns, matching: .literal("rowid = ?", rowid)).first
     }
 
     /// The text of the given column, with the highlighting prefix and suffix strings, if this column matched the search query.
@@ -267,6 +279,8 @@ public struct BlackbirdModelSearchResult<T: BlackbirdModel>: Identifiable, Senda
         var attrString = AttributedString()
         
         let scanner = Scanner(string: text)
+        scanner.charactersToBeSkipped = nil
+        
         while !scanner.isAtEnd {
             if let before = scanner.scanUpToString(prefix) { attrString.append(AttributedString(before)) }
 
@@ -304,11 +318,11 @@ extension BlackbirdModel {
     ///
     /// This is a heavy operation that may take noticeable time on large indexes.
     public static func optimizeFullTextIndex(in database: Blackbird.Database) async throws {
-        try await optimizeFullTextIndexIsolated(in: database, core: database.core)
+        try await optimizeFullTextIndex(core: database.core)
     }
 
     /// Synchronous version of ``optimizeFullTextIndex(in:)``.
-    public static func optimizeFullTextIndexIsolated(in database: Blackbird.Database, core: isolated Blackbird.Database.Core) throws {
+    public static func optimizeFullTextIndex(core: isolated Blackbird.Database.Core) throws {
         if Self.fullTextSearchableColumns.isEmpty { return }
     
         let ftsTable = Blackbird.Table.FullTextIndexSchema.ftsTableName(Self.tableName)
@@ -327,13 +341,13 @@ extension BlackbirdModel {
     ///
     /// This requires that this model has at least one total column, and all columns referenced in the `matching` argument, specified in ``BlackbirdModel/fullTextSearchableColumns``.
     public static func fullTextSearch(from database: Blackbird.Database, matching: BlackbirdModelColumnExpression<Self>, limit: Int? = nil, options: BlackbirdModelSearchOptions<Self> = .init()) async throws -> [Self.SearchResult] {
-        try await fullTextSearchIsolated(from: database, core: database.core, matching: matching, limit: limit, options: options)
+        try await fullTextSearch(from: database.core, matching: matching, limit: limit, options: options)
     }
 
     /// Synchronous version of ``fullTextSearch(from:matching:limit:options:)``.
-    public static func fullTextSearchIsolated(from database: Blackbird.Database, core: isolated Blackbird.Database.Core, matching: BlackbirdModelColumnExpression<Self>, limit: Int? = nil, options: BlackbirdModelSearchOptions<Self> = .init()) throws -> [Self.SearchResult] {
+    public static func fullTextSearch(from core: isolated Blackbird.Database.Core, matching: BlackbirdModelColumnExpression<Self>, limit: Int? = nil, options: BlackbirdModelSearchOptions<Self> = .init()) throws -> [Self.SearchResult] {
         let decoded = DecodedStructuredFTSQuery<Self>(matching: matching, options: options, limit: limit)
-        return try decoded.query(in: database, core: core, scoreMultiplier: options.scoreMultiple)
+        return try decoded.query(in: core, scoreMultiplier: options.scoreMultiple)
     }
 
     internal static func fullTextQueryEscape(_ query: String, mode: BlackbirdFullTextQuerySyntaxMode) -> String {
@@ -399,7 +413,30 @@ fileprivate struct DecodedStructuredFTSQuery<T: BlackbirdModel>: Sendable {
     init(matching: BlackbirdModelColumnExpression<T>, options: BlackbirdModelSearchOptions<T>, limit: Int?) {
         self.options = options
         table = SchemaGenerator.shared.table(for: T.self)
-        guard let fullTextIndex = table.fullTextIndex else { fatalError("[Blackbird] \(String(describing: T.self)) does not define any fullTextSearchableColumns.") }
+
+        guard let fullTextIndex = table.fullTextIndex else {
+            fatalError("[Blackbird] \(String(describing: T.self)) does not define any fullTextSearchableColumns.")
+        }
+
+        for orderBy in options.orderBy {
+            switch orderBy.direction {
+                case .ascending(column: let column):
+                    guard T.fullTextSearchableColumns[column] != nil else {
+                        let keyPathName = table.keyPathToColumnName(keyPath: column)
+                        fatalError("Column \\.$\(keyPathName) in full-text-search order-by clause is not included in `\(table.name).fullTextSearchableColumns`. Consider adding it as .filterOnly.")
+                    }
+
+                case .descending(column: let column):
+                    guard T.fullTextSearchableColumns[column] != nil else {
+                        let keyPathName = table.keyPathToColumnName(keyPath: column)
+                        fatalError("Column \\.$\(keyPathName) in full-text-search order-by clause is not included in `\(table.name).fullTextSearchableColumns`. Consider adding it as .filterOnly.")
+                    }
+
+                case .random:
+                    break
+            }
+        }
+        
         let ftsTableName = Blackbird.Table.FullTextIndexSchema.ftsTableName(T.tableName)
         var clauses: [String] = []
         var arguments: [Blackbird.Value] = []
@@ -444,7 +481,13 @@ fileprivate struct DecodedStructuredFTSQuery<T: BlackbirdModel>: Sendable {
         if let whereClause { clauses.append("WHERE \(whereClause)") }
         arguments.append(contentsOf: whereArguments)
         
-        clauses.append("ORDER BY `\(scoreColumnName)` DESC")
+        if !options.orderBy.isEmpty {
+            let table = table
+            let orderBy = options.orderBy
+            clauses.append("ORDER BY \(orderBy.map { $0.orderByClause(table: table) }.joined(separator: ",")) ")
+        } else {
+            clauses.append("ORDER BY `\(scoreColumnName)` DESC")
+        }
 
         if let limit { clauses.append("LIMIT \(limit)") }
 
@@ -456,17 +499,17 @@ fileprivate struct DecodedStructuredFTSQuery<T: BlackbirdModel>: Sendable {
         self.cacheKey = cacheKey
     }
     
-    func query(in database: Blackbird.Database, core: isolated Blackbird.Database.Core, scoreMultiplier: Double) throws -> [BlackbirdModelSearchResult<T>] {
+    func query(in core: isolated Blackbird.Database.Core, scoreMultiplier: Double) throws -> [BlackbirdModelSearchResult<T>] {
         var results: [BlackbirdModelSearchResult<T>] = []
-        for row in try T.queryIsolated(in: database, core: core, query, arguments: arguments) {
-            if let result = try result(database: database, core: core, ftsRow: row, scoreMultiplier: scoreMultiplier) {
+        for row in try T.query(in: core, query, arguments: arguments) {
+            if let result = try result(core: core, ftsRow: row, scoreMultiplier: scoreMultiplier) {
                 results.append(result)
             }
         }
         return results
     }
     
-    private func result(database: Blackbird.Database, core: isolated Blackbird.Database.Core, ftsRow: Blackbird.ModelRow<T>, scoreMultiplier: Double) throws -> BlackbirdModelSearchResult<T>? {
+    private func result(core: isolated Blackbird.Database.Core, ftsRow: Blackbird.ModelRow<T>, scoreMultiplier: Double) throws -> BlackbirdModelSearchResult<T>? {
         guard let rowid = ftsRow["rowid"], let score = ftsRow[scoreColumnName] else {
             fatalError("Unexpected result row format from FTS query on \(String(describing: T.self)) (missing rowid or score)")
         }
@@ -485,7 +528,7 @@ fileprivate struct DecodedStructuredFTSQuery<T: BlackbirdModel>: Sendable {
             idx += 1
         }
         
-        let preloadedInstance = try options.preloadInstances ? T.readIsolated(from: database, core: core, sqlWhere: "rowid = ?", arguments: [rowid]).first : nil
+        let preloadedInstance = try options.preloadInstances ? T.read(from: core, sqlWhere: "rowid = ?", arguments: [rowid]).first : nil
         return BlackbirdModelSearchResult<T>(highlights: .init(highlightRow, table: table), highlightMode: options.highlights, snippets: .init(snippetRow, table: table), snippetMode: options.snippets, rowid: rowid, score: (score.doubleValue ?? 0) * scoreMultiplier, preloadedInstance: preloadedInstance)
     }
 }
