@@ -374,17 +374,22 @@ extension Blackbird.Database {
 
 
 extension BlackbirdModel {
-    internal func _saveCachedInstance(for database: Blackbird.Database) {
-        let cacheLimit = Self.cacheLimit
-        if cacheLimit > 0, let pkValues = try? self.primaryKeyValues(), pkValues.count == 1, let pk = try? Blackbird.Value.fromAny(pkValues.first!) {
-            database.cache.writeModel(tableName: Self.tableName, primaryKey: pk, instance: self, entryLimit: cacheLimit)
-        }
-    }
+	internal func _saveCachedInstance(for database: Blackbird.Database) {
+		if Self.cacheLimit > 0 {
+			let pkValues = self.primaryKeyValues()
+			if pkValues.count == 1, let pk = try? Blackbird.Value.fromAny(pkValues.first!) {
+				database.cache.writeModel(tableName: Self.tableName, primaryKey: pk, instance: self, entryLimit: Self.cacheLimit)
+			}
+		}
+	}
 
     internal func _deleteCachedInstance(for database: Blackbird.Database) {
-        if Self.cacheLimit > 0, let pkValues = try? self.primaryKeyValues(), pkValues.count == 1, let pk = try? Blackbird.Value.fromAny(pkValues.first!) {
-            database.cache.deleteModel(tableName: Self.tableName, primaryKey: pk)
-        }
+		if Self.cacheLimit > 0 {
+			let pkValues = self.primaryKeyValues()
+			if pkValues.count == 1, let pk = try? Blackbird.Value.fromAny(pkValues.first!) {
+				database.cache.deleteModel(tableName: Self.tableName, primaryKey: pk)
+			}
+		}
     }
 
     internal static func _cachedInstance(for database: Blackbird.Database, primaryKeyValue: Blackbird.Value) -> Self? {
