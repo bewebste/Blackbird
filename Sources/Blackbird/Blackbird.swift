@@ -403,14 +403,27 @@ extension Blackbird {
         public init(value: Int = 0) { state = Locked(State(value: value)) }
         
         public func wait() async {
-            let wait = state.withLock { state in
-                state.value -= 1
-                return state.value < 0
-            }
-            
-            if wait {
-                await withCheckedContinuation { continuation in
-                    state.withLock { $0.waiting.append(continuation) }
+            // The decrement and the "register myself as a waiter" steps must happen
+            // atomically under the same lock acquisition. The previous implementation
+            // released the lock between the two, so a concurrent `signal()` firing in
+            // that window would see `waiting.isEmpty == true`, return without resuming
+            // anyone, and the about-to-suspend waiter would then enqueue itself with
+            // no signal pending — stranded until a future signal happened to arrive.
+            //
+            // Under heavy contention (e.g. many concurrent tasks each issuing several
+            // async transactions through `asyncTransactionSemaphore`) this lost-signal
+            // race repeats until every concurrent waiter is stranded and the database
+            // effectively deadlocks. Doing both steps inside a single `withLock` —
+            // synchronously resuming the continuation if the value stayed non-negative,
+            // otherwise enqueueing it — closes the window.
+            await withCheckedContinuation { continuation in
+                state.withLock { state in
+                    state.value -= 1
+                    if state.value >= 0 {
+                        continuation.resume()
+                    } else {
+                        state.waiting.append(continuation)
+                    }
                 }
             }
         }
